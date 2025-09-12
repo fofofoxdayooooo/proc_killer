@@ -1,4 +1,4 @@
-# proc-killer-v9
+# proc-killer
 
 **proc-killer-v9** is a mission-critical daemon for automatically monitoring and terminating long-running processes in shared server environments.  
 It is optimized for both **Linux** and **FreeBSD**, with optional **systemd** integration.
