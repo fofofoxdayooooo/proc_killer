@@ -1,5 +1,13 @@
 /*
- * proc_killer_v4.c - Process killer daemon (Linux + FreeBSD)
+ * proc_killer_v9_ultimate.c - The ultimate process killer daemon for large-scale environments.
+ *
+ * This version incorporates the final set of enhancements for mission-critical reliability, including:
+ * - A more robust, unique process identifier key to mitigate PID reuse risks.
+ * - Improved log rate-limiting with summary timestamps.
+ * - Native systemd watchdog support for enhanced service reliability.
+ * - An explicit option to enforce mandatory configuration file existence.
+ *
+ * The core logic remains highly optimized for performance and scalability on both Linux and FreeBSD.
  *
  * Features:
  * - Runs as root (necessary for killing other users' processes)
@@ -9,24 +17,28 @@
  * - Regex cmdline blacklist
  * - Execution time limit for non-allow processes
  * - Debug levels:
- * DEBUG_LEVEL=1 -> detect only (log only, no kill)
- * DEBUG_LEVEL=2 -> SIGTERM only
- * DEBUG_LEVEL=3 -> SIGTERM + SIGKILL
+ * DEBUG_LEVEL=0 -> Dry-run (detects and logs, but does not kill)
+ * DEBUG_LEVEL=1 -> LOG_DEBUG (detect only, no kill, for SIGTERM and SIGKILL)
+ * DEBUG_LEVEL=2 -> LOG_INFO (SIGTERM only)
+ * DEBUG_LEVEL=3 -> LOG_NOTICE (SIGTERM + SIGKILL)
  * - PID file
  * - Logging via syslog (facility: DAEMON)
  * - Reloads config on SIGHUP
  * - Graceful shutdown on SIGINT/SIGTERM
- * - Uses Hash Tables for allow and user lists for performance
- * - Robust configuration reloading
+ * - Uses Hash Tables for allow, user, and UID/username lists for performance
+ * - Robust configuration reloading with mtime checks
  * - Security check for configuration file permissions (root:root, 0600)
- * - Uses a non-blocking 'kill list' to manage SIGTERM/SIGKILL grace period
+ * - Uses a hash table-based 'kill list' for efficient grace period management, complemented by a min-heap for cleanup.
  * - Uniquely identifies processes with PID + start time to prevent re-use errors
- * - systemd notify support using sd_notify() for Type=notify service
+ * - **NEW**: Enhanced unique process key: PID + UID + comm + start_time.
+ * - **NEW**: Log rate-limiting summary includes start and end timestamps.
+ * - **NEW**: systemd watchdog support.
+ * - **NEW**: Configuration existence can be mandatory via CONFIG_REQUIRED=1.
  *
  * Compilation:
- * Linux (with systemd):   gcc -O2 -Wall -o proc_killer_v4 proc_killer_v4.c -lregex -lsystemd
- * Linux (without systemd): gcc -O2 -Wall -o proc_killer_v4 proc_killer_v4.c -lregex
- * FreeBSD:                cc  -O2 -Wall -o proc_killer_v4 proc_killer_v4.c -lregex
+ * Linux (with systemd):   gcc -O2 -Wall -o proc_killer_v9 proc_killer_v9_ultimate.c -lregex -lsystemd
+ * Linux (without systemd): gcc -O2 -Wall -o proc_killer_v9 proc_killer_v9_ultimate.c -lregex
+ * FreeBSD:                cc  -O2 -Wall -o proc_killer_v9 proc_killer_v9_ultimate.c -lregex
  */
 
 #define _GNU_SOURCE
@@ -45,10 +57,11 @@
 #include <limits.h>
 #include <regex.h>
 #include <syslog.h>
+#include <fcntl.h>
 
 #ifdef __linux__
-// Required for systemd support on Linux
 #include <systemd/sd-daemon.h>
+#include <syscall.h>
 #endif
 
 #ifdef __FreeBSD__
@@ -63,7 +76,7 @@ typedef struct node {
     struct node *next;
 } Node;
 
-#define HASH_TABLE_SIZE 1024
+#define HASH_TABLE_SIZE 4096 // Increased hash table size for large environments
 typedef struct {
     Node *buckets[HASH_TABLE_SIZE];
 } HashTable;
@@ -77,37 +90,150 @@ typedef struct regex_node {
     struct regex_node *next;
 } RegexNode;
 
-// Node for the non-blocking kill list
-typedef struct kill_node {
-    pid_t pid;
-    long long start_time;
+// Node for the UID cache, now with TTL
+typedef struct {
+    char *username;
+    time_t last_used;
+} UidCache;
+#define UID_CACHE_TTL_SECONDS 3600 // 1 hour
+
+// Node for the kill list and min-heap, with added info for logging
+typedef struct {
     time_t sigterm_time;
-    struct kill_node *next;
+    char *username;
+    char *exe_path;
+    long long start_time;
 } KillNode;
 
-// Default configuration paths
-#define DEFAULT_ALLOW_LIST          "/etc/proc_killer/proc_allow_list"
-#define DEFAULT_USER_LIST           "/etc/proc_killer/monitor_users"
-#define DEFAULT_PID_FILE            "/run/proc_killer.pid"
-#define DEFAULT_CMDLINE_BLACKLIST   "/etc/proc_killer/cmdline_blacklist_regex"
-#define DEFAULT_CHECK_INTERVAL      30
-#define DEFAULT_MAX_SECONDS         300
-#define DEFAULT_GRACE_PERIOD        5
+// A combined structure for the min-heap
+typedef struct {
+    time_t expire_time;
+    char *hash_key; // Key to the hash table
+} HeapNode;
+
+typedef struct {
+    HeapNode **data;
+    size_t capacity;
+    size_t size;
+} MinHeap;
+
+// New struct for log rate limiting, now with timestamps
+typedef struct {
+    time_t first_log_time;
+    time_t last_log_time;
+    int count;
+} LogRate;
 
 // Global configuration pointers for easy cleanup and reloading
 HashTable *allow_list_ht = NULL;
 HashTable *user_limits_ht = NULL;
+HashTable *uid_cache_ht = NULL;
+HashTable *kill_list_ht = NULL;
+MinHeap *kill_heap = NULL;
 RegexNode *blacklist_head = NULL;
-KillNode *kill_list_head = NULL;
+HashTable *log_rate_ht = NULL;
 
 int DEBUG_LEVEL = 3;
 int CHECK_INTERVAL;
 int MAX_SECONDS;
 int GRACE_PERIOD;
+int LOG_RATE_LIMIT_SECONDS;
+int CONFIG_REQUIRED;
 const char *PID_FILE;
+int log_level;
+int config_failed_flag = 0;
+
+// Store mtime for each config file to detect changes
+time_t allow_list_mtime = 0;
+time_t user_list_mtime = 0;
+time_t blacklist_mtime = 0;
 
 volatile sig_atomic_t reload_flag = 0;
 volatile sig_atomic_t shutdown_flag = 0;
+
+/* -------- Min-Heap Functions -------- */
+MinHeap *minheap_create(size_t capacity) {
+    MinHeap *heap = malloc(sizeof(MinHeap));
+    if (!heap) return NULL;
+    heap->data = malloc(sizeof(HeapNode*) * capacity);
+    if (!heap->data) {
+        free(heap);
+        return NULL;
+    }
+    heap->capacity = capacity;
+    heap->size = 0;
+    return heap;
+}
+
+void minheap_swap(MinHeap *heap, size_t i, size_t j) {
+    HeapNode *temp = heap->data[i];
+    heap->data[i] = heap->data[j];
+    heap->data[j] = temp;
+}
+
+void minheap_heapify_down(MinHeap *heap, size_t index) {
+    size_t smallest = index;
+    size_t left = 2 * index + 1;
+    size_t right = 2 * index + 2;
+
+    if (left < heap->size && heap->data[left]->expire_time < heap->data[smallest]->expire_time) {
+        smallest = left;
+    }
+    if (right < heap->size && heap->data[right]->expire_time < heap->data[smallest]->expire_time) {
+        smallest = right;
+    }
+
+    if (smallest != index) {
+        minheap_swap(heap, index, smallest);
+        minheap_heapify_down(heap, smallest);
+    }
+}
+
+void minheap_heapify_up(MinHeap *heap, size_t index) {
+    while (index > 0 && heap->data[(index - 1) / 2]->expire_time > heap->data[index]->expire_time) {
+        minheap_swap(heap, index, (index - 1) / 2);
+        index = (index - 1) / 2;
+    }
+}
+
+void minheap_insert(MinHeap *heap, HeapNode *node) {
+    if (heap->size == heap->capacity) {
+        size_t new_capacity = heap->capacity * 2;
+        HeapNode **new_data = realloc(heap->data, sizeof(HeapNode*) * new_capacity);
+        if (!new_data) {
+            syslog(LOG_ERR, "Failed to reallocate min-heap. Cannot insert.");
+            free(node->hash_key);
+            free(node);
+            return;
+        }
+        heap->data = new_data;
+        heap->capacity = new_capacity;
+    }
+    
+    size_t index = heap->size++;
+    heap->data[index] = node;
+    minheap_heapify_up(heap, index);
+}
+
+HeapNode *minheap_extract_min(MinHeap *heap) {
+    if (heap->size == 0) return NULL;
+
+    HeapNode *root = heap->data[0];
+    heap->data[0] = heap->data[--heap->size];
+    minheap_heapify_down(heap, 0);
+
+    return root;
+}
+
+void minheap_free(MinHeap *heap) {
+    if (!heap) return;
+    for (size_t i = 0; i < heap->size; ++i) {
+        free(heap->data[i]->hash_key);
+        free(heap->data[i]);
+    }
+    free(heap->data);
+    free(heap);
+}
 
 /* -------- Utility Functions -------- */
 
@@ -123,6 +249,18 @@ unsigned int hash(const char *key) {
     return value;
 }
 
+// Simple integer hash function for UID
+unsigned int hash_int(int key) {
+    return (unsigned int)key % HASH_TABLE_SIZE;
+}
+
+// Creates a unique, robust key for a process
+char *create_kill_key(pid_t pid, long long start_time, const char *comm, uid_t uid) {
+    char key[4096];
+    snprintf(key, sizeof(key), "%d:%lld:%d:%s", pid, start_time, uid, comm);
+    return strdup(key);
+}
+
 // Initializes a hash table
 HashTable *create_hashtable() {
     HashTable *ht = calloc(1, sizeof(HashTable));
@@ -135,7 +273,10 @@ HashTable *create_hashtable() {
 
 // Inserts a key-value pair into a hash table
 int hashtable_insert(HashTable *ht, const char *key, void *value) {
-    if (!ht || !key) return -1;
+    if (!ht || !key) {
+        syslog(LOG_WARNING, "hashtable_insert called with null ht or key");
+        return -1;
+    }
     unsigned int index = hash(key);
     Node *new_node = malloc(sizeof(Node));
     if (!new_node) {
@@ -145,6 +286,7 @@ int hashtable_insert(HashTable *ht, const char *key, void *value) {
     new_node->key = strdup(key);
     if (!new_node->key) {
         free(new_node);
+        syslog(LOG_ERR, "Failed to allocate key string");
         return -1;
     }
     new_node->value = value;
@@ -165,6 +307,69 @@ void *hashtable_lookup(HashTable *ht, const char *key) {
     return NULL;
 }
 
+// Inserts an integer key-value pair into a hash table
+int hashtable_insert_int(HashTable *ht, int key, void *value) {
+    if (!ht) return -1;
+    unsigned int index = hash_int(key);
+    Node *new_node = malloc(sizeof(Node));
+    if (!new_node) {
+        syslog(LOG_ERR, "Failed to allocate memory for hash node");
+        return -1;
+    }
+    char key_str[16];
+    snprintf(key_str, sizeof(key_str), "%d", key);
+    new_node->key = strdup(key_str);
+    if (!new_node->key) {
+        free(new_node);
+        return -1;
+    }
+    new_node->value = value;
+    new_node->next = ht->buckets[index];
+    ht->buckets[index] = new_node;
+    return 0;
+}
+
+// Looks up a value by integer key in a hash table
+void *hashtable_lookup_int(HashTable *ht, int key) {
+    if (!ht) return NULL;
+    unsigned int index = hash_int(key);
+    char key_str[16];
+    snprintf(key_str, sizeof(key_str), "%d", key);
+    for (Node *node = ht->buckets[index]; node; node = node->next) {
+        if (strcmp(node->key, key_str) == 0) {
+            return node->value;
+        }
+    }
+    return NULL;
+}
+
+// Removes a key-value pair from a hash table
+int hashtable_remove(HashTable *ht, const char *key, void (*free_value_func)(void *)) {
+    if (!ht || !key) return -1;
+    unsigned int index = hash(key);
+    Node *cur = ht->buckets[index];
+    Node *prev = NULL;
+
+    while(cur) {
+        if(strcmp(cur->key, key) == 0) {
+            if(prev) {
+                prev->next = cur->next;
+            } else {
+                ht->buckets[index] = cur->next;
+            }
+            free(cur->key);
+            if(free_value_func) {
+                free_value_func(cur->value);
+            }
+            free(cur);
+            return 0;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+    return -1;
+}
+
 // Frees a hash table
 void free_hashtable(HashTable *ht, void (*free_value_func)(void *)) {
     if (!ht) return;
@@ -181,15 +386,6 @@ void free_hashtable(HashTable *ht, void (*free_value_func)(void *)) {
         }
     }
     free(ht);
-}
-
-// Frees the memory for a kill list
-void free_kill_list(KillNode *head) {
-    while (head) {
-        KillNode *tmp = head;
-        head = head->next;
-        free(tmp);
-    }
 }
 
 // Loads a list from a file into a hash table
@@ -211,6 +407,7 @@ HashTable *load_list_to_hashtable(const char *path) {
         line[strcspn(line, "\r\n")] = 0;
         if (strlen(line) == 0 || line[0] == '#') continue;
         if (hashtable_insert(ht, line, NULL) != 0) {
+            syslog(LOG_ERR, "Failed to insert into hash table for %s", path);
             free(line);
             fclose(fp);
             free_hashtable(ht, NULL);
@@ -263,6 +460,7 @@ HashTable *load_user_limits_to_hashtable(const char *path) {
         }
 
         if (hashtable_insert(ht, user_name, u) != 0) {
+            syslog(LOG_ERR, "Failed to insert into hash table for %s", path);
             free(u);
             free(line);
             fclose(fp);
@@ -352,10 +550,60 @@ int get_user_limit(HashTable *ht, const char *uname) {
     return -1; // Not a monitored user
 }
 
-// Logs the action to syslog
+// Logs the action to syslog with rate limiting
 void log_action(const char *user, pid_t pid,
                 const char *exe, long long etime, const char *action) {
-    syslog(LOG_NOTICE, "proc_killer %s USER=%s PID=%d EXE=%s ETIME=%llds",
+    // Determine log level based on action
+    int level = LOG_INFO;
+    if (strstr(action, "SIGKILL")) {
+        level = LOG_NOTICE;
+    } else if (strstr(action, "SIGTERM")) {
+        level = LOG_INFO;
+    } else if (strstr(action, "DETECTED")) {
+        level = LOG_DEBUG;
+    } else if (strstr(action, "ZOMBIE")) {
+        level = LOG_WARNING;
+    }
+
+    if (LOG_RATE_LIMIT_SECONDS > 0) {
+        char key_buf[512];
+        snprintf(key_buf, sizeof(key_buf), "%s:%s:%s", user, exe, action);
+
+        LogRate *lr = hashtable_lookup(log_rate_ht, key_buf);
+        time_t now = time(NULL);
+
+        if (lr) {
+            if ((now - lr->last_log_time) < LOG_RATE_LIMIT_SECONDS) {
+                lr->count++;
+                return; // Suppress log
+            } else {
+                if (lr->count > 1) {
+                    char start_time_str[32], end_time_str[32];
+                    strftime(start_time_str, sizeof(start_time_str), "%H:%M:%S", localtime(&lr->first_log_time));
+                    strftime(end_time_str, sizeof(end_time_str), "%H:%M:%S", localtime(&lr->last_log_time));
+                    syslog(level, "proc_killer [SUMMARY] %s count=%d (from %s to %s). USER=%s PID=%d EXE=%s ETIME=%llds",
+                           action, lr->count, start_time_str, end_time_str, user, pid, exe, etime);
+                }
+                lr->first_log_time = now;
+                lr->last_log_time = now;
+                lr->count = 1;
+            }
+        } else {
+            lr = calloc(1, sizeof(LogRate));
+            if (!lr) {
+                syslog(LOG_ERR, "Failed to allocate memory for log rate limiter.");
+                syslog(level, "proc_killer %s USER=%s PID=%d EXE=%s ETIME=%llds",
+                       action, user, pid, exe, etime);
+                return;
+            }
+            lr->first_log_time = now;
+            lr->last_log_time = now;
+            lr->count = 1;
+            hashtable_insert(log_rate_ht, key_buf, lr);
+        }
+    }
+    
+    syslog(level, "proc_killer %s USER=%s PID=%d EXE=%s ETIME=%llds",
            action, user, pid, exe, etime);
 }
 
@@ -408,51 +656,175 @@ int check_config_permissions(const char *path) {
     return 0;
 }
 
-// Adds a process to the kill list
-void add_to_kill_list(pid_t pid, long long start_time) {
-    // Check if the process is already in the list
-    for (KillNode *node = kill_list_head; node; node = node->next) {
-        if (node->pid == pid && node->start_time == start_time) {
-            return;
-        }
+void free_kill_node(void *value) {
+    if (value) {
+        KillNode *node = (KillNode *)value;
+        free(node->username);
+        free(node->exe_path);
+        free(node);
     }
-    // Add new node to the head
-    KillNode *new_node = calloc(1, sizeof(KillNode));
-    if (!new_node) {
-        syslog(LOG_ERR, "Failed to allocate memory for kill list node");
-        return;
-    }
-    new_node->pid = pid;
-    new_node->start_time = start_time;
-    new_node->sigterm_time = time(NULL);
-    new_node->next = kill_list_head;
-    kill_list_head = new_node;
 }
 
-// Process the kill list
+void free_lograte(void *value) {
+    if (value) {
+        free(value);
+    }
+}
+
+// Adds a process to the kill list (using hash table and min-heap)
+void add_to_kill_list(pid_t pid, long long start_time, const char *uname, const char *exepath, uid_t uid, const char *comm) {
+    char *key = create_kill_key(pid, start_time, comm, uid);
+    if (!key) return;
+
+    if (hashtable_lookup(kill_list_ht, key)) {
+        free(key);
+        return; // Already in the list
+    }
+
+    // Allocate and initialize the kill node for the hash table
+    KillNode *new_kill_node = calloc(1, sizeof(KillNode));
+    if (!new_kill_node) {
+        syslog(LOG_ERR, "Failed to allocate memory for kill list node");
+        free(key);
+        return;
+    }
+    new_kill_node->sigterm_time = time(NULL);
+    new_kill_node->username = strdup(uname);
+    new_kill_node->exe_path = strdup(exepath);
+    new_kill_node->start_time = start_time;
+
+    // Allocate and initialize the heap node
+    HeapNode *new_heap_node = calloc(1, sizeof(HeapNode));
+    if (!new_heap_node) {
+        syslog(LOG_ERR, "Failed to allocate memory for heap node");
+        free(new_kill_node->username);
+        free(new_kill_node->exe_path);
+        free(new_kill_node);
+        free(key);
+        return;
+    }
+    new_heap_node->expire_time = new_kill_node->sigterm_time + GRACE_PERIOD;
+    new_heap_node->hash_key = key;
+
+    // Insert into both data structures
+    if (hashtable_insert(kill_list_ht, key, new_kill_node) != 0) {
+        syslog(LOG_ERR, "Failed to insert into kill list hash table");
+        free(new_kill_node->username);
+        free(new_kill_node->exe_path);
+        free(new_kill_node);
+        free(new_heap_node->hash_key);
+        free(new_heap_node);
+    } else {
+        minheap_insert(kill_heap, new_heap_node);
+    }
+}
+
+// Process the kill list (using the min-heap)
 void process_kill_list() {
-    KillNode *cur = kill_list_head;
-    KillNode *prev = NULL;
     time_t now = time(NULL);
 
-    while (cur) {
-        // Check if the process is still running and the grace period has expired
-        if ((now - cur->sigterm_time) > GRACE_PERIOD) {
-            if (kill(cur->pid, 0) == 0) { // Check if process still exists
-                if (kill(cur->pid, SIGKILL) == 0) {
-                    syslog(LOG_NOTICE, "proc_killer SIGKILL PID=%d after grace period.", cur->pid);
+    while (kill_heap->size > 0 && kill_heap->data[0]->expire_time <= now) {
+        // Extract the root (oldest expired process)
+        HeapNode *expired_node = minheap_extract_min(kill_heap);
+        if (!expired_node) continue;
+        
+        // Lookup the process info from the hash table
+        KillNode *kill_node = hashtable_lookup(kill_list_ht, expired_node->hash_key);
+        if (kill_node) {
+            pid_t pid = 0;
+            // The unique key is now more complex, need to extract PID
+            sscanf(expired_node->hash_key, "%d:", &pid);
+            
+            #ifdef __linux__
+            char path[256], buf[4096];
+            snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+            FILE *fp = fopen(path, "r");
+            char state = ' ';
+            if (fp && fgets(buf, sizeof(buf), fp)) {
+                sscanf(buf, "%*d %*s %c", &state);
+            }
+            if (state == 'Z') {
+                log_action(kill_node->username, pid, kill_node->exe_path, now - kill_node->sigterm_time, "ZOMBIE DETECTED");
+            }
+            fclose(fp);
+            #endif
+            
+            if (kill(pid, 0) == 0) { // Check if process still exists
+                if (kill(pid, SIGKILL) == 0) {
+                    log_action(kill_node->username, pid, kill_node->exe_path, now - kill_node->sigterm_time, "SIGKILL");
                 }
-            }
-            // Remove node from list
-            if (prev) {
-                prev->next = cur->next;
             } else {
-                kill_list_head = cur->next;
+                syslog(LOG_DEBUG, "PID %d not found. Old process terminated.", pid);
             }
-            KillNode *tmp = cur;
-            cur = cur->next;
-            free(tmp);
-        } else {
+        }
+        
+        hashtable_remove(kill_list_ht, expired_node->hash_key, free_kill_node);
+        free(expired_node->hash_key);
+        free(expired_node);
+    }
+}
+
+// UID-to-username caching function
+const char *getpwuid_cached(uid_t uid) {
+    UidCache *cached_user = hashtable_lookup_int(uid_cache_ht, uid);
+    if (cached_user) {
+        cached_user->last_used = time(NULL);
+        return cached_user->username;
+    }
+
+    struct passwd *pw = getpwuid(uid);
+    if (!pw) {
+        return NULL;
+    }
+
+    UidCache *new_cache = calloc(1, sizeof(UidCache));
+    if (!new_cache) {
+        syslog(LOG_ERR, "Failed to allocate memory for UID cache node. Not caching.");
+        return pw->pw_name;
+    }
+
+    new_cache->username = strdup(pw->pw_name);
+    if (!new_cache->username) {
+        free(new_cache);
+        syslog(LOG_ERR, "Failed to allocate username string for UID cache. Not caching.");
+        return pw->pw_name;
+    }
+    new_cache->last_used = time(NULL);
+
+    if (hashtable_insert_int(uid_cache_ht, uid, new_cache) != 0) {
+        syslog(LOG_ERR, "Failed to insert into UID cache hash table. Not caching.");
+        free(new_cache->username);
+        free(new_cache);
+    }
+    return new_cache->username;
+}
+
+// Cleans up old UID cache entries based on TTL
+void cleanup_uid_cache() {
+    time_t now = time(NULL);
+    for (int i = 0; i < HASH_TABLE_SIZE; ++i) {
+        Node *cur = uid_cache_ht->buckets[i];
+        Node *prev = NULL;
+
+        while (cur) {
+            UidCache *cache = (UidCache *)cur->value;
+            if ((now - cache->last_used) > UID_CACHE_TTL_SECONDS) {
+                // Time to expire this entry
+                Node *to_remove = cur;
+                if (prev) {
+                    prev->next = cur->next;
+                } else {
+                    uid_cache_ht->buckets[i] = cur->next;
+                }
+                cur = cur->next;
+
+                syslog(LOG_DEBUG, "Removing expired UID cache entry for user: %s", cache->username);
+                free(cache->username);
+                free(cache);
+                free(to_remove->key);
+                free(to_remove);
+                continue;
+            }
             prev = cur;
             cur = cur->next;
         }
@@ -462,47 +834,34 @@ void process_kill_list() {
 /* -------- Platform-specific process scan -------- */
 
 #ifdef __linux__
-
-// Reads the command line from /proc/<pid>/cmdline using dynamic memory
-char *read_cmdline(pid_t pid) {
+char *read_cmdline_light(pid_t pid, char *buf, size_t buf_len) {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
-
-    FILE *fp = fopen(path, "r");
-    if (!fp) return NULL;
-
-    char *line = NULL;
-    size_t len = 0;
-    ssize_t read = getline(&line, &len, fp);
-    fclose(fp);
     
-    if (read == -1) {
-        free(line);
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) return NULL;
+
+    ssize_t read_bytes = pread(fd, buf, buf_len - 1, 0);
+    close(fd);
+
+    if (read_bytes <= 0) {
+        buf[0] = '\0';
         return NULL;
     }
+    buf[read_bytes] = '\0';
 
-    // Replace null terminators with spaces
-    for (ssize_t i = 0; i < read; i++) {
-        if (line[i] == '\0') {
-            line[i] = ' ';
+    for (ssize_t i = 0; i < read_bytes; i++) {
+        if (buf[i] == '\0') {
+            buf[i] = ' ';
         }
     }
-    return line;
+    return buf;
 }
 
-// Gets process info from /proc
 int get_process_info(pid_t pid, char *comm, size_t clen,
-                      uid_t *uid, long long *etime, long long *start_ticks, char *exepath, size_t plen) {
+                      long long *etime, long long *start_ticks, char *exepath, size_t plen) {
     char path[256], buf[4096];
     FILE *fp;
-
-    // Get UID from /proc/<pid> stat file
-    snprintf(path, sizeof(path), "/proc/%d", pid);
-    struct stat st;
-    if (stat(path, &st) == -1) return -1;
-    *uid = st.st_uid;
-
-    // Get command name and start time from /proc/<pid>/stat
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
     fp = fopen(path, "r");
     if (!fp) return -1;
@@ -522,7 +881,6 @@ int get_process_info(pid_t pid, char *comm, size_t clen,
     char *stat_end = paren_close + 1;
     sscanf(stat_end, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %lld", start_ticks);
 
-    // Get uptime to calculate elapsed time
     double uptime = 0.0;
     fp = fopen("/proc/uptime", "r");
     if (!fp) return -1;
@@ -533,7 +891,6 @@ int get_process_info(pid_t pid, char *comm, size_t clen,
     *etime = (long long)(uptime - (double)*start_ticks / hz);
     if (*etime < 0) *etime = 0;
 
-    // Get executable path
     snprintf(path, sizeof(path), "/proc/%d/exe", pid);
     ssize_t len2 = readlink(path, exepath, plen - 1);
     if (len2 >= 0) {
@@ -543,11 +900,9 @@ int get_process_info(pid_t pid, char *comm, size_t clen,
     }
     return 0;
 }
-
 #endif /* __linux__ */
 
 #ifdef __FreeBSD__
-// Gets all processes using sysctl
 int get_processes(struct kinfo_proc **procs) {
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
     size_t len;
@@ -561,44 +916,66 @@ int get_processes(struct kinfo_proc **procs) {
     return len / sizeof(struct kinfo_proc);
 }
 
-// Helper to get full command line arguments on FreeBSD
-char *get_freebsd_cmdline(pid_t pid, char *buf, size_t buflen) {
+// Dynamically allocates memory for the full command line on FreeBSD
+char *get_freebsd_cmdline(pid_t pid) {
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ARGS, pid };
-    size_t len = buflen;
-    if (sysctl(mib, 4, buf, &len, NULL, 0) < 0) {
+    size_t len;
+
+    // First call to get the required size
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) < 0) {
         return NULL;
     }
+    
+    if (len == 0) return NULL;
+    
+    char *buf = malloc(len);
+    if (!buf) {
+        syslog(LOG_ERR, "Failed to allocate memory for FreeBSD cmdline.");
+        return NULL;
+    }
+
+    // Second call to get the data
+    if (sysctl(mib, 4, buf, &len, NULL, 0) < 0) {
+        free(buf);
+        return NULL;
+    }
+    
+    // Replace null terminators with spaces
     for (size_t i = 0; i < len; i++) {
         if (buf[i] == '\0') buf[i] = ' ';
     }
+    // Ensure the string is null-terminated
+    if (len > 0) buf[len-1] = '\0';
+    
     return buf;
 }
-
 #endif /* __FreeBSD__ */
 
-// Performs the kill action based on debug level
-void perform_kill(pid_t pid, const char *uname, const char *exepath, long long etime, const char *type, long long start_time) {
-    if (DEBUG_LEVEL <= 1) {
-        log_action(uname, pid, exepath, etime, "DETECTED");
+void perform_kill(pid_t pid, const char *uname, const char *exepath, long long etime, const char *type, long long start_time, uid_t uid, const char *comm) {
+    if (DEBUG_LEVEL == 0) { // dry-run mode
+        log_action(uname, pid, exepath, etime, "DETECTED (DRY-RUN)");
         return;
     }
 
-    // Only send SIGTERM if not already in the kill list
-    int found_in_list = 0;
-    for (KillNode *node = kill_list_head; node; node = node->next) {
-        if (node->pid == pid && node->start_time == start_time) {
-            found_in_list = 1;
-            break;
-        }
+    if (DEBUG_LEVEL <= 1) { // detect-only mode
+        log_action(uname, pid, exepath, etime, "DETECTED");
+        return;
     }
+    
+    char *key = create_kill_key(pid, start_time, comm, uid);
+    if (!key) return;
 
-    if (!found_in_list) {
-        if (DEBUG_LEVEL >= 2) {
-            if (kill(pid, SIGTERM) == 0) {
-                log_action(uname, pid, exepath, etime, "SIGTERM");
-                if (DEBUG_LEVEL >= 3) {
-                    add_to_kill_list(pid, start_time);
-                }
+    if (hashtable_lookup(kill_list_ht, key)) {
+        free(key);
+        return; // Already in the kill list
+    }
+    free(key);
+
+    if (DEBUG_LEVEL >= 2) {
+        if (kill(pid, SIGTERM) == 0) {
+            log_action(uname, pid, exepath, etime, "SIGTERM");
+            if (DEBUG_LEVEL >= 3) {
+                add_to_kill_list(pid, start_time, uname, exepath, uid, comm);
             }
         }
     }
@@ -608,6 +985,7 @@ void perform_kill(pid_t pid, const char *uname, const char *exepath, long long e
 
 void monitor() {
     process_kill_list(); // Check for processes to SIGKILL
+    cleanup_uid_cache(); // Clean up expired UID cache entries
     
 #ifdef __linux__
     DIR *dir = opendir("/proc");
@@ -619,35 +997,40 @@ void monitor() {
     while ((ent = readdir(dir))) {
         if (!isdigit(ent->d_name[0])) continue;
         pid_t pid = atoi(ent->d_name);
-        char comm[256], exepath[PATH_MAX];
-        uid_t uid; long long etime, start_ticks;
-        if (get_process_info(pid, comm, sizeof(comm), &uid, &etime, &start_ticks, exepath, sizeof(exepath)) != 0) continue;
+        
+        char path[256];
+        snprintf(path, sizeof(path), "/proc/%d", pid);
+        struct stat st;
+        if (stat(path, &st) == -1) continue;
+        uid_t uid = st.st_uid;
 
-        struct passwd *pw = getpwuid(uid);
-        if (!pw) continue;
-        const char *uname = pw->pw_name;
+        const char *uname = getpwuid_cached(uid);
+        if (!uname) continue;
 
         int limit = get_user_limit(user_limits_ht, uname);
         if (limit < 0) continue;
 
-        char *cmdline = read_cmdline(pid);
-        if (!cmdline) continue;
+        char comm[256], exepath[PATH_MAX];
+        long long etime, start_ticks;
+        
+        if (get_process_info(pid, comm, sizeof(comm), &etime, &start_ticks, exepath, sizeof(exepath)) != 0) continue;
+
+        char cmdline_buf[4096];
+        char *cmdline = read_cmdline_light(pid, cmdline_buf, sizeof(cmdline_buf));
+        if (!cmdline) cmdline = comm;
 
         if (match_regex_list(blacklist_head, cmdline)) {
-            perform_kill(pid, uname, exepath, etime, "BLACKLISTED", start_ticks);
-            free(cmdline);
+            perform_kill(pid, uname, exepath, etime, "BLACKLISTED", start_ticks, uid, comm);
             continue;
         }
 
         if (hashtable_lookup(allow_list_ht, comm) || hashtable_lookup(allow_list_ht, exepath)) {
-            free(cmdline);
             continue;
         }
 
         if (etime > limit) {
-            perform_kill(pid, uname, exepath, etime, "TIMED_OUT", start_ticks);
+            perform_kill(pid, uname, exepath, etime, "TIMED_OUT", start_ticks, uid, comm);
         }
-        free(cmdline);
     }
     closedir(dir);
 #endif /* __linux__ */
@@ -660,42 +1043,46 @@ void monitor() {
         return;
     }
     time_t now = time(NULL);
-    char cmdbuf[2048];
     for (int i = 0; i < n; i++) {
         struct kinfo_proc *kp = &procs[i];
         pid_t pid = kp->ki_pid;
         const char *comm = kp->ki_comm;
         uid_t uid = kp->ki_uid;
+        long long start_time = kp->ki_start.tv_sec;
 
-        struct passwd *pw = getpwuid(uid);
-        if (!pw) continue;
-        const char *uname = pw->pw_name;
+        const char *uname = getpwuid_cached(uid);
+        if (!uname) continue;
 
         int limit = get_user_limit(user_limits_ht, uname);
         if (limit < 0) continue;
 
-        long long etime = (long long)difftime(now, kp->ki_start.tv_sec);
+        long long etime = (long long)difftime(now, start_time);
         if (etime < 0) etime = 0;
 
         char exepath[PATH_MAX];
         strncpy(exepath, comm, sizeof(exepath) - 1);
         exepath[sizeof(exepath) - 1] = '\0';
 
-        char *cmdline = get_freebsd_cmdline(pid, cmdbuf, sizeof(cmdbuf));
+        char *cmdline = get_freebsd_cmdline(pid);
         if (!cmdline) {
             cmdline = (char *)comm;
         }
 
         if (match_regex_list(blacklist_head, cmdline)) {
-            perform_kill(pid, uname, exepath, etime, "BLACKLISTED", kp->ki_start.tv_sec);
+            perform_kill(pid, uname, exepath, etime, "BLACKLISTED", start_time, uid, comm);
+            if (cmdline != comm) free(cmdline);
             continue;
         }
 
-        if (hashtable_lookup(allow_list_ht, comm) || hashtable_lookup(allow_list_ht, exepath)) continue;
+        if (hashtable_lookup(allow_list_ht, comm) || hashtable_lookup(allow_list_ht, exepath)) {
+             if (cmdline != comm) free(cmdline);
+             continue;
+        }
 
         if (etime > limit) {
-            perform_kill(pid, uname, exepath, etime, "TIMED_OUT", kp->ki_start.tv_sec);
+            perform_kill(pid, uname, exepath, etime, "TIMED_OUT", start_time, uid, comm);
         }
+        if (cmdline != comm) free(cmdline);
     }
     free(procs);
 #endif /* __FreeBSD__ */
@@ -708,8 +1095,11 @@ void cleanup() {
     #endif
     free_hashtable(allow_list_ht, NULL);
     free_hashtable(user_limits_ht, free);
+    free_hashtable(uid_cache_ht, free);
+    free_hashtable(kill_list_ht, free_kill_node);
+    free_hashtable(log_rate_ht, free_lograte);
+    minheap_free(kill_heap);
     free_regex_list(blacklist_head);
-    free_kill_list(kill_list_head);
     if (PID_FILE) {
         unlink(PID_FILE);
     }
@@ -719,26 +1109,84 @@ void cleanup() {
 // Atomically reloads the configuration
 void reload_config() {
     syslog(LOG_INFO, "Reloading configuration...");
-
-    HashTable *new_allow = load_list_to_hashtable(getenv_or("ALLOW_LIST_FILE", DEFAULT_ALLOW_LIST));
-    if (new_allow) {
-        free_hashtable(allow_list_ht, NULL);
-        allow_list_ht = new_allow;
+    
+    int success = 1;
+    HashTable *new_allow = NULL;
+    HashTable *new_users = NULL;
+    RegexNode *new_blacklist = NULL;
+    
+    const char *allow_path = getenv_or("ALLOW_LIST_FILE", "/etc/proc_killer/proc_allow_list");
+    struct stat st_allow;
+    int allow_changed = (stat(allow_path, &st_allow) == 0 && st_allow.st_mtime > allow_list_mtime);
+    if (allow_changed) {
+        syslog(LOG_INFO, "Loading new allow list: %s", allow_path);
+        new_allow = load_list_to_hashtable(allow_path);
+        if (!new_allow) {
+            syslog(LOG_ERR, "Failed to load new allow list.");
+            success = 0;
+        }
     }
 
-    HashTable *new_users = load_user_limits_to_hashtable(getenv_or("USER_LIST_FILE", DEFAULT_USER_LIST));
-    if (new_users) {
-        free_hashtable(user_limits_ht, free);
-        user_limits_ht = new_users;
+    const char *users_path = getenv_or("USER_LIST_FILE", "/etc/proc_killer/monitor_users");
+    struct stat st_users;
+    int users_changed = (stat(users_path, &st_users) == 0 && st_users.st_mtime > user_list_mtime);
+    if (users_changed) {
+        syslog(LOG_INFO, "Loading new user limits: %s", users_path);
+        new_users = load_user_limits_to_hashtable(users_path);
+        if (!new_users) {
+            syslog(LOG_ERR, "Failed to load new user limits.");
+            success = 0;
+        }
     }
 
-    RegexNode *new_blacklist = load_regex_list(getenv_or("CMDLINE_BLACKLIST_FILE", DEFAULT_CMDLINE_BLACKLIST));
-    if (new_blacklist) {
-        free_regex_list(blacklist_head);
-        blacklist_head = new_blacklist;
+    const char *blacklist_path = getenv_or("CMDLINE_BLACKLIST_FILE", "/etc/proc_killer/cmdline_blacklist_regex");
+    struct stat st_blacklist;
+    int blacklist_changed = (stat(blacklist_path, &st_blacklist) == 0 && st_blacklist.st_mtime > blacklist_mtime);
+    if (blacklist_changed) {
+        syslog(LOG_INFO, "Loading new blacklist: %s", blacklist_path);
+        new_blacklist = load_regex_list(blacklist_path);
+        if (!new_blacklist) {
+            syslog(LOG_ERR, "Failed to load new blacklist.");
+            success = 0;
+        }
+    }
+    
+    // Check if any file exists at all
+    if (CONFIG_REQUIRED && (!new_allow || !new_users || !new_blacklist)) {
+        syslog(LOG_ERR, "CONFIG_REQUIRED is set and one or more configuration files failed to load. Aborting.");
+        config_failed_flag = 1;
+        // Free temp pointers before exit
+        if (new_allow) free_hashtable(new_allow, NULL);
+        if (new_users) free_hashtable(new_users, free);
+        if (new_blacklist) free_regex_list(new_blacklist);
+        return;
     }
 
-    syslog(LOG_INFO, "Configuration reload complete. Some files may have failed to load.");
+    if (success) {
+        if (new_allow) {
+            free_hashtable(allow_list_ht, NULL);
+            allow_list_ht = new_allow;
+            allow_list_mtime = st_allow.st_mtime;
+        }
+        if (new_users) {
+            free_hashtable(user_limits_ht, free);
+            user_limits_ht = new_users;
+            user_list_mtime = st_users.st_mtime;
+        }
+        if (new_blacklist) {
+            free_regex_list(blacklist_head);
+            blacklist_head = new_blacklist;
+            blacklist_mtime = st_blacklist.st_mtime;
+        }
+        syslog(LOG_INFO, "Configuration reload complete.");
+        config_failed_flag = 0;
+    } else {
+        syslog(LOG_WARNING, "Configuration reload failed. Continuing with previous settings.");
+        // Free temporarily allocated memory if a failure occurred
+        if (new_allow) free_hashtable(new_allow, NULL);
+        if (new_users) free_hashtable(new_users, free);
+        if (new_blacklist) free_regex_list(new_blacklist);
+    }
 }
 
 // Signal handler using sigaction
@@ -756,21 +1204,19 @@ void sig_handler(int signo) {
 
 /* -------- Main -------- */
 
-int main() {
+int main(int argc, char *argv[]) {
     if (geteuid() != 0) {
         fprintf(stderr, "Error: must be root to start.\n");
         return 1;
     }
 
-    // Check config file permissions before daemonizing
-    if (check_config_permissions(getenv_or("ALLOW_LIST_FILE", DEFAULT_ALLOW_LIST)) != 0 ||
-        check_config_permissions(getenv_or("USER_LIST_FILE", DEFAULT_USER_LIST)) != 0 ||
-        check_config_permissions(getenv_or("CMDLINE_BLACKLIST_FILE", DEFAULT_CMDLINE_BLACKLIST)) != 0) {
+    if (check_config_permissions(getenv_or("ALLOW_LIST_FILE", "/etc/proc_killer/proc_allow_list")) != 0 ||
+        check_config_permissions(getenv_or("USER_LIST_FILE", "/etc/proc_killer/monitor_users")) != 0 ||
+        check_config_permissions(getenv_or("CMDLINE_BLACKLIST_FILE", "/etc/proc_killer/cmdline_blacklist_regex")) != 0) {
         fprintf(stderr, "Aborting due to insecure configuration file permissions.\n");
         return 1;
     }
 
-    // Use sigaction for robust signal handling
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sig_handler;
@@ -789,43 +1235,83 @@ int main() {
         return 1;
     }
 
-    // In systemd environments, the PID file is managed by systemd and is not needed
     if (getenv("NOTIFY_SOCKET") == NULL) {
         daemonize();
         openlog("proc_killer", LOG_PID | LOG_NDELAY, LOG_DAEMON);
-        PID_FILE = getenv_or("PID_FILE", DEFAULT_PID_FILE);
+        PID_FILE = getenv_or("PID_FILE", "/run/proc_killer.pid");
         write_pid_file(PID_FILE);
     } else {
         openlog("proc_killer", LOG_PID | LOG_NDELAY, LOG_DAEMON);
     }
-
-    // Now close all other file descriptors except for standard ones
-    for (int x = sysconf(_SC_OPEN_MAX); x >= 0; x--) {
-        if (x != STDIN_FILENO && x != STDOUT_FILENO && x != STDERR_FILENO) {
+    
+#ifdef __linux__
+    if (syscall(SYS_close_range, 3, ~0U, 0) == -1 && errno == ENOSYS) {
+        for (int x = sysconf(_SC_OPEN_MAX); x >= 3; x--) {
             close(x);
         }
     }
-    // And finally redirect standard I/O to /dev/null
+#elif defined(__FreeBSD__)
+    closefrom(3);
+#else
+    for (int x = sysconf(_SC_OPEN_MAX); x >= 3; x--) {
+        close(x);
+    }
+#endif
+    
     stdin = fopen("/dev/null", "r");
     stdout = fopen("/dev/null", "w");
     stderr = fopen("/dev/null", "w");
 
     syslog(LOG_INFO, "proc_killer daemon starting.");
 
-    // Read initial configuration from environment variables
     CHECK_INTERVAL = atoi(getenv_or("CHECK_INTERVAL", "30"));
     MAX_SECONDS    = atoi(getenv_or("MAX_SECONDS", "300"));
     GRACE_PERIOD   = atoi(getenv_or("GRACE_PERIOD", "5"));
+    LOG_RATE_LIMIT_SECONDS = atoi(getenv_or("LOG_RATE_LIMIT_SECONDS", "30"));
     DEBUG_LEVEL    = atoi(getenv_or("DEBUG_LEVEL", "3"));
+    CONFIG_REQUIRED = atoi(getenv_or("CONFIG_REQUIRED", "0"));
+
+    // Check for --safe-mode argument
+    if (argc > 1 && strcmp(argv[1], "--safe-mode") == 0) {
+        DEBUG_LEVEL = 0;
+    }
     
-    // In non-systemd environments, the PID file is not managed by systemd, so it is created during daemonization
-    if (getenv("NOTIFY_SOCKET") == NULL) {
-        PID_FILE       = getenv_or("PID_FILE", DEFAULT_PID_FILE);
-        write_pid_file(PID_FILE);
+    switch (DEBUG_LEVEL) {
+        case 0: log_level = LOG_INFO; break;
+        case 1: log_level = LOG_DEBUG; break;
+        case 2: log_level = LOG_INFO; break;
+        case 3:
+        default: log_level = LOG_NOTICE; break;
+    }
+    setlogmask(LOG_UPTO(log_level));
+    
+    allow_list_ht = create_hashtable();
+    user_limits_ht = create_hashtable();
+    uid_cache_ht = create_hashtable();
+    kill_list_ht = create_hashtable();
+    log_rate_ht = create_hashtable();
+    
+    // Initial heap capacity is 1024, now dynamically extended
+    kill_heap = minheap_create(1024);
+    
+    if (!allow_list_ht || !user_limits_ht || !uid_cache_ht || !kill_list_ht || !log_rate_ht || !kill_heap) {
+        syslog(LOG_ERR, "Failed to initialize data structures. Aborting.");
+        cleanup();
+        return 1;
     }
 
     reload_config();
-
+    if (config_failed_flag) {
+        if (CONFIG_REQUIRED) {
+            syslog(LOG_ERR, "Initial configuration load failed and CONFIG_REQUIRED is set. Aborting.");
+            cleanup();
+            return 1;
+        } else {
+            DEBUG_LEVEL = 0;
+            syslog(LOG_WARNING, "Initial configuration load failed. Starting in SAFE MODE (DEBUG_LEVEL=0). No processes will be killed until a successful reload.");
+        }
+    }
+    
     #ifdef __linux__
     sd_notify(0, "READY=1\nSTATUS=Monitoring processes...");
     #endif
@@ -834,10 +1320,25 @@ int main() {
         if (reload_flag) {
             reload_config();
             reload_flag = 0;
+            if (config_failed_flag) {
+                if (CONFIG_REQUIRED) {
+                    syslog(LOG_ERR, "Configuration reload failed and CONFIG_REQUIRED is set. Shutting down.");
+                    shutdown_flag = 1;
+                    continue;
+                } else {
+                    DEBUG_LEVEL = 0;
+                    syslog(LOG_WARNING, "Configuration reload failed again. Remaining in SAFE MODE.");
+                }
+            }
             #ifdef __linux__
             sd_notify(0, "STATUS=Configuration reloaded. Monitoring processes...");
             #endif
         }
+
+        #ifdef __linux__
+        sd_notify(0, "WATCHDOG=1");
+        #endif
+        
         monitor();
         sleep(CHECK_INTERVAL);
     }
