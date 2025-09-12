@@ -1,0 +1,16 @@
+[Unit]
+Description=Process Killer Daemon (Syslog Version)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/proc_killer
+EnvironmentFile=-/etc/sysconfig/proc_killer.conf
+PIDFile=/run/proc_killer.pid
+Restart=always
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=proc_killer
+
+[Install]
+WantedBy=multi-user.target
