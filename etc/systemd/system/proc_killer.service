@@ -1,16 +1,13 @@
 [Unit]
-Description=Process Killer Daemon (Syslog Version)
+Description=Process Killer Daemon
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=/usr/local/sbin/proc_killer
+Type=notify
+ExecStart=/usr/local/sbin/proc_killer_v9
 EnvironmentFile=-/etc/sysconfig/proc_killer.conf
-PIDFile=/run/proc_killer.pid
 Restart=always
-StandardOutput=syslog
-StandardError=syslog
-SyslogIdentifier=proc_killer
+WatchdogSec=60s
 
 [Install]
 WantedBy=multi-user.target
