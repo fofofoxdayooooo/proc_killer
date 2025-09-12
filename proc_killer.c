@@ -1,5 +1,5 @@
 /*
- * proc_killer_v9_ultimate.c - The ultimate process killer daemon for large-scale environments.
+ * proc_killer.c - The ultimate process killer daemon for large-scale environments.
  *
  * This version incorporates the final set of enhancements for mission-critical reliability, including:
  * - A more robust, unique process identifier key to mitigate PID reuse risks.
