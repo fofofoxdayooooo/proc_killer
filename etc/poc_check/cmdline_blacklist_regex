@@ -1,0 +1,18 @@
+# Regular expressions matched against process command line.
+# Any match → highest priority kill (ignores allow list & user limits).
+
+# Perl sleep bombs
+^perl .*sleep
+
+# Fork bombs
+.*fork.*
+
+# Netcat misuse
+(^| )nc( |$)
+
+# Long-running wget or curl
+(^| )wget( |$)
+(^| )curl( |$)
+
+# Dangerous shell loops
+:(){ :|:& };:
