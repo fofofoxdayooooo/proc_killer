@@ -1,0 +1,9 @@
+# Monitored users and their individual max runtime (seconds).
+# Format: username[,seconds]
+# If seconds is omitted, fallback to MAX_SECONDS from proc_killer.conf.
+
+user1
+user2,40
+user3,120
+user4
+user5,600
