@@ -1,0 +1,37 @@
+# コマンドラインに含まれていたら無慈悲にKILLするキーワード一覧
+# （空行と # から始まる行は無視されます）
+
+# 単純な長時間プロセス
+sleep
+yes
+watch
+
+# 無限ループ構文
+while
+until
+for
+
+# フォーク爆弾類
+:(){ :|:& };:
+fork
+
+# CPUドレイン攻撃
+dd if=/dev/zero
+cat /dev/urandom
+yes > /dev/null
+
+# Perl/Python等での長時間処理
+python -c
+perl -e
+
+# 意図的な長いwait（Node.js等）
+setTimeout
+async function
+
+# サーバー起動阻止目的など
+php -S
+python3 -m http.server
+
+# ストレージ攻撃など
+mkfs
+rm -rf /
