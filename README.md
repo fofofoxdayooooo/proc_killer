@@ -42,17 +42,17 @@ It is optimized for both **Linux** and **FreeBSD**, with optional **systemd** in
 
 **Linux (with systemd support):**
 ```bash
-gcc -O2 -Wall -o /usr/local/sbin/proc_killer_v9 proc_killer.c -lregex -lsystemd
+gcc -O2 -Wall -o /usr/local/sbin/proc_killer.c -lregex -lsystemd
 ```
 
 **Linux (without systemd support):**
 ```bash
-gcc -O2 -Wall -o /usr/local/sbin/proc_killer_v9 proc_killer.c -lregex
+gcc -O2 -Wall -o /usr/local/sbin/proc_killer.c -lregex
 ```
 
 **FreeBSD:**
 ```bash
-cc -O2 -Wall -o /usr/local/sbin/proc_killer_v9 proc_killer.c -lregex
+cc -O2 -Wall -o /usr/local/sbin/proc_killer.c -lregex
 ```
 ---
 
