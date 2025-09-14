@@ -79,15 +79,22 @@ chmod 600 /etc/sysconfig/proc_killer.conf /etc/poc_check/*
 ### Example Configuration
 /etc/sysconfig/proc_killer.conf
 ```bash
-CHECK_INTERVAL=30
-MAX_SECONDS=300
-GRACE_PERIOD=5
+[main]
+# デフォルトの制限時間（秒）
+DEFAULT_TIME_LIMIT=3600
+
+# ログ出力レベル / kill 動作レベル
+# 0 = Dry-run（検知のみ）
+# 1 = LOG_DEBUG（検知のみ、killなし）
+# 2 = LOG_INFO（SIGTERMのみ）
+# 3 = LOG_NOTICE（SIGTERM + SIGKILL）
 DEBUG_LEVEL=3
-LOG_RATE_LIMIT_SECONDS=30
-CONFIG_REQUIRED=1
-ALLOW_LIST_FILE=/etc/poc_check/proc_allow_list
-USER_LIST_FILE=/etc/poc_check/monitor_users
-CMDLINE_BLACKLIST_FILE=/etc/poc_check/cmdline_blacklist_regex
+
+# 外部設定ファイルを include して管理
+include=/etc/proc_killer/proc_allow_list.conf
+include=/etc/proc_killer/monitor_users.conf
+include=/etc/proc_killer/cmdline_blacklist.conf
+include=/etc/proc_killer/cmdline_blacklist_regex.conf
 ```
 
 /etc/poc_check/proc_allow_list
@@ -159,12 +166,10 @@ man
 # Monitored users and their individual max runtime (seconds).
 # Format: username[,seconds]
 # If seconds is omitted, fallback to MAX_SECONDS from proc_killer.conf.
-
-user1
-user2,40
-user3,120
-user4
-user5,600
+[user_limits]
+attacker=0         # 即 kill
+noisyuser=300      # 5分超過で kill
+tester=600         # 10分超過で kill
 ```
 
 /etc/poc_check/cmdline_blacklist_regex
@@ -210,9 +215,10 @@ WantedBy=multi-user.target
 ### Usage
 Start and enable via systemd:
 ```bash
-systemctl daemon-reload
-systemctl enable proc_killer.service
-systemctl start proc_killer.service
+systemctl daemon-reexec
+systemctl enable proc_killer
+systemctl start proc_killer
+systemctl status proc_killer
 
 ```
 Reload configuration at runtime:
