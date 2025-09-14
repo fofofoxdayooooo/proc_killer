@@ -1,13 +1,29 @@
 [Unit]
-Description=Process Killer Daemon
+Description=Proc Killer Daemon
 After=network.target
 
 [Service]
-Type=notify
-ExecStart=/usr/local/sbin/proc_killer_v9
+Type=simple
+ExecStart=/usr/local/sbin/proc_killer
+# フォアグラウンド実行したい場合は --foreground を追加
+# ExecStart=/usr/local/sbin/proc_killer --foreground
+
+# 設定ファイル
 EnvironmentFile=-/etc/sysconfig/proc_killer.conf
+
+# PID ファイル
+PIDFile=/var/run/proc_killer.pid
+
+# systemd Watchdog サポート
+WatchdogSec=60
 Restart=always
-WatchdogSec=60s
+RestartSec=5
+
+# セキュリティ強化オプション（任意）
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
